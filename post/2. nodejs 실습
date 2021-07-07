@@ -1,0 +1,11 @@
+
+
+
+1. vscode 설치
+2. nodejs 설치
+3. 프로젝트 생성 & npm init
+- npm오류시, nodejs 파일을 환경변수로 등록하기
+
+4. express 설치 : npm install express
+5. opencv4nodejs 설치 : [설치방법](https://www.npmjs.com/package/opencv4nodejs#how-to-install)
+6. socket.io 설치 : 
