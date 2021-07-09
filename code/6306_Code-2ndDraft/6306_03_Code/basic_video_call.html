@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+
+<!-- webrtc 설정을 작성하는 스크립트 -->
+<script>
+/*
+
+  webrtc_polyfill.js by Rob Manson
+  NOTE: Based on adapter.js by Adam Barth
+
+  The MIT License
+
+  Copyright (c) 2010-2013 Rob Manson, http://buildAR.com. All rights reserved.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+
+*/
+
+
+// 기본 기능을 나타내는 전역변수
+var webrtc_capable = true;
+
+var rtc_peer_connection = null; // RTCPeerConnection (파이어폭스라면 mozRTCPeerConnection / 크롬이라면 webkitRTCPeerConnection)
+var rtc_session_description = null; // RTCPeerConnection에 따라 달라짐
+var get_user_media = null;
+
+var connect_stream_to_src = null; // MediaStreamObject와 HTML5 <video> media 요소를 참조하는 함수
+
+var stun_server = "stun.l.google.com:19302"; // 구글의 공개 STUN 서버 (DNS기반의 호스트네임과 포트)
+
+
+// 브라우저를 판단하는 부분
+if (navigator.getUserMedia) { // WebRTC 1.0 standard compliant browser
+  rtc_peer_connection = RTCPeerConnection;
+  rtc_session_description = RTCSessionDescription;
+  get_user_media = navigator.getUserMedia.bind(navigator);
+
+  // 표준 버전에서는 media_stream을 .srcObject 속성에 직접 할당한다.
+  connect_stream_to_src = function(media_stream, media_element) { // https://www.w3.org/Bugs/Public/show_bug.cgi?id=21606
+    media_element.srcObject = media_stream;
+    media_element.play();
+  };
+} else if (navigator.mozGetUserMedia) { // early firefox webrtc implementation
+  rtc_peer_connection = mozRTCPeerConnection;
+  rtc_session_description = mozRTCSessionDescription;
+  get_user_media = navigator.mozGetUserMedia.bind(navigator);
+
+  // 파이어폭스 초기 버전에서는 .mozSrcObject속성에 media_stream 오브젝트를 할당한다.
+  connect_stream_to_src = function(media_stream, media_element) {
+    media_element.mozSrcObject = media_stream;
+    media_element.play();
+  };
+  stun_server = "74.125.31.127:19302";
+} else if (navigator.webkitGetUserMedia) { // early webkit webrtc implementation
+  rtc_peer_connection = webkitRTCPeerConnection;
+  rtc_session_description = RTCSessionDescription;
+  get_user_media = navigator.webkitGetUserMedia.bind(navigator);
+
+  // 초반 webkit 기반 브라우저에서는 <video> 요소의 .src 속성에 바로 할당한다.
+  connect_stream_to_src = function(media_stream, media_element) {
+    media_element.src = webkitURL.createObjectURL(media_stream);
+  };
+} else {
+  alert("This browser does not support WebRTC - visit WebRTC.org for more info");
+  webrtc_capable = false;
+}
+</script>
+
+
+<!--브라우저의 로직을 정의하는 스크립트 -->
+<script>
+/*
+
+  basic_video_call.js by Rob Manson
+
+  The MIT License
+
+  Copyright (c) 2010-2013 Rob Manson, http://buildAR.com. All rights reserved.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+
+*/
+
+var call_token; // 두 사용자를 연결하는 고유 토큰
+var signaling_server; // 발신자와 수신자 양쪽 모두가 시그널링 서버에 연결하기 위해 사용하는 WebSocketAPI
+var peer_connection; // 두 사용자 사이에 생성될 실제 RTCPeerConnection
+
+/*
+ 
+ 웹 페이지에서 호출되는 기본 start() 함수
+ 
+  - 기본적으로 사용자가 발신자인지 수신자인지 감지하고, 이에 알맞은 기능을 설정
+  - 발신자와 수신자 양쪽에서 사용되는 공통함수들을 정의
+  
+*/ 
+ function start() {
+
+  // WebRTC 피어 연결 오브젝트 생성
+  // rtc_peer_connection 생성자를 사용하여 peer_connection 변수를 실제 RTCPeerConnection 오브젝트로 할당한다.
+  peer_connection = new rtc_peer_connection({ // RTCPeerConnection configuration 
+
+    // 우리가 사용할 STUN 서버를 정의하는 구성 오브젝트를 start() 함수에 전달한다. 
+    "iceServers": [ // information about ice servers
+      { "url": "stun:"+stun_server }, // stun server info
+    ]
+  });
+
+  // 다른 피어에 ICE 후보를 전송하는 일반 핸들러
+  peer_connection.onicecandidate = function (ice_event) {
+
+    // 만약 ice_event가 ICE 후보를 포함하는 경우
+    if (ice_event.candidate) {
+      signaling_server.send(
+        JSON.stringify({ // JSON Blob으로 직렬화
+          type: "new_ice_candidate",
+          candidate: ice_event.candidate ,
+        })
+      );
+    }
+  };
+
+  // peer_connection.onaddstream 함수 : 단순히 새로운 비디오 스트림 입력을 수신하고, 로컬 브라우저의 로컬 <video> 요소에 연결함으로써 상대방의 모습과 목소리를 들을 수 있게 해준다.
+  // 원격 비디오 스트림 수신 시, 이를 표시
+  peer_connection.onaddstream = function (event) {
+
+    connect_stream_to_src(event.stream, document.getElementById("remote_video"));
+    // hide placeholder and show remote video
+    document.getElementById("loading_state").style.display = "none";
+    document.getElementById("open_call_state").style.display = "block";
+
+  };
+
+  // setup stream from the local camera 
+  setup_video();
+
+  // 웹소켓 API를 사용하여 일반적인 시그널링 서버 연결 설정하기
+  // 두 사용자 모두 동일한 시그널링 서버에 연결되도록 하는 것이 중요하다.
+  //signaling_server = new WebSocket("ws://192.168.22.58:1234");
+  signaling_server = new WebSocket("ws://192.168.217.33:1234");
+
+  // document.location.hash란? URL 내 '#'뒤에 오는 식별자를 value로 하는 DOMString
+  if (document.location.hash === "" || document.location.hash === undefined) { // 발신자라면!
+  /*
+    발신자라면 웹사이트에 처음 방문했을 것이기 때문에 call_token을 가지고 있지 않을 것이므로
+    새로운 토큰을 만들고 location.hash에 설정한다.
+  */
+
+    // 새로운 토큰을 만들고 location.hash에 설정한다.
+    var token = Date.now()+"-"+Math.round(Math.random()*10000);
+    call_token = "#"+token;
+    document.location.hash = token;
+
+    // ??????????????????????
+    signaling_server.onopen = function() {
+      // setup caller signal handler
+      signaling_server.onmessage = caller_signal_handler;
+
+      // tell the signaling server you have joined the call 
+      signaling_server.send(
+        JSON.stringify({ 
+          token:call_token,
+          type:"join",
+        })
+      );
+    }
+
+    document.title = "You are the 발신자 (Caller) ";
+    document.getElementById("loading_state").innerHTML = "Ready for a call...ask your friend to visit:<br/><br/>"+document.location;
+
+  } else { // 수신자라면! ( call_token(hash)을 가지고 있다면 무조건 수신자 )
+    
+    // get the unique token for this call from location.hash
+    call_token = document.location.hash;
+
+    signaling_server.onopen = function() {
+      // setup caller signal handler
+      signaling_server.onmessage = callee_signal_handler;
+
+      // tell the signaling server you have joined the call 
+      signaling_server.send(
+        JSON.stringify({ 
+          token:call_token,
+          type:"join",
+        })
+      );
+
+      signaling_server.send(
+        JSON.stringify({ 
+          token:call_token,
+          type:"callee_arrived",
+        })
+      );
+    }
+
+    document.title = "You are the 수신자 (Callee)";
+    document.getElementById("loading_state").innerHTML = "One moment please...connecting your call...";
+  }
+
+}
+
+/* 발신자 또는 수신자가 사용하는 여러 일반적인 핸들러 함수들을 정의 */
+
+// JSEP 제안/응답 과정에서 새로운 디스크립션을 처리하는 함수를 구현
+// 새로운 디스크립션을 처리하는 핸들러
+function new_description_created(description) {
+  peer_connection.setLocalDescription(
+    description, 
+    function () {
+      signaling_server.send(
+        JSON.stringify({
+          token:call_token,
+          type:"new_description",
+          sdp:description 
+        })
+      );
+    }, 
+    log_error
+  );
+}
+
+// 발신자 측면에서 시그널링 서버에서 수신한 모든 시그널들을 처리하는 함수를 구현
+// handle signals as a caller
+function caller_signal_handler(event) {
+  var signal = JSON.parse(event.data);
+
+  // 1) signal.type이 callee_arrived이면, JSEP 제안/응답 과정을 시작
+  if (signal.type === "callee_arrived") {
+    peer_connection.createOffer(
+      new_description_created, 
+      log_error
+    );
+  // 2) signal.type이 new_ice_candidate이면, 이 후보는 peer_connection에 추가됨
+  } else if (signal.type === "new_ice_candidate") {
+    peer_connection.addIceCandidate(
+      new RTCIceCandidate(signal.candidate)
+    );
+  // 3) signal.type이 new_description이면, peer_connection.setRemoteDescription()을 호출함
+  } else if (signal.type === "new_description") {
+    peer_connection.setRemoteDescription(
+      new rtc_session_description(signal.sdp), 
+      function () {
+        if (peer_connection.remoteDescription.type == "answer") {
+          // extend with your own custom answer handling here
+        }
+      },
+      log_error
+    );
+  // 4) 사용자 정의 시그널로 확장
+  } else {
+    // extend with your own signal types here
+  }
+}
+
+// 수신자 측면에서 시그널링 서버에서 수신한 모든 시그널들을 처리하는 기능을 구현
+// handle signals as a callee
+function callee_signal_handler(event) 
+{
+  var signal = JSON.parse(event.data);
+
+  // 1) signal.type이 new_ice_candidate이면, 이 후보는 peer_connection에 추가됨
+  if (signal.type === "new_ice_candidate") {
+    peer_connection.addIceCandidate(
+      new RTCIceCandidate(signal.candidate)
+    );
+  } 
+  // 2) signal.type이 new_description이면, 이 후보는 peer_connection.setRemoteDescription() 함수를 호출함
+  else if (signal.type === "new_description") {
+    peer_connection.setRemoteDescription(
+        /*
+          여기서 중요한 점은 시그널링 서버는 시그널링 데이터 내용을 몰라도 된다는 것이다. 
+          비록 이것은 SDP 이지만, 몰라도 큰 문제가 되진 않는다. 
+          메세지의 내용들은 그저 시그널링 서버를 통해 상대편으로 가기만 하면된다. 
+          중요한 점은 ICE subsystem이 신호 데이터를 다른 피어에게 보내도록 지시하면, 다른 피어는 이 정보를 수신하여 자체 ICE subsystem에 전달하는 방법을 알고 있다는 것이다.
+        */
+      new rtc_session_description(signal.sdp), 
+      function () {
+        if (peer_connection.remoteDescription.type == "offer") {
+          peer_connection.createAnswer(new_description_created, log_error);
+        }
+      },
+      log_error
+    );
+  } 
+  // 3) 사용자 정의 시그널 타입으로 확장
+  else {
+    // extend with your own signal types here
+  }
+}
+
+/* 
+  getUserMedia 호출을 사용하여 로컬 카메라의 비디오 스트림에 접근하는 함수를 구현 
+
+  - 이 스트림이 성공적으로 설정되면, 
+    로컬 브라우저 페이지의 <video> 요소에 표시되고 동시에 peer_connection 오브젝트에 추가되어 원격지 피어의 브라우저로 전송할 수 있다. 
+
+  - 로컬 스트림이 실패한 경우, 사용자가 알 수 있도록 오류를 통보한다. 
+
+*/
+// 로컬 카메라의 스트림 설정
+function setup_video() {
+  get_user_media(
+    { 
+      "audio": true, // request access to local microphone
+      "video": true  // request access to local camera
+    }, 
+    // 성공시 callback
+    function (local_stream) { 
+      // display preview from the local camera & microphone using local <video> MediaElement
+      connect_stream_to_src(local_stream, document.getElementById("local_video"));
+      // add local camera stream to peer_connection ready to be sent to the remote peer
+      peer_connection.addStream(local_stream);
+    },
+    // 에러시 callback
+    log_error
+  );
+}
+
+// 오류를 기록하고 사용자에게 통보할 수 있도록 에러 핸들러 함수를 정의한다. 
+function log_error(error) {
+  console.log(error);
+}
+</script>
+
+<style>
+html, body {
+  padding: 0px;
+  margin: 0px;
+  font-family: "Arial","Helvetica",sans-serif;
+}
+#loading_state {
+  position: absolute;
+  top: 45%;
+  left: 0px;
+  width: 100%;
+  font-size: 20px;
+  text-align: center;
+}
+#open_call_state {
+  display: none;
+}
+#local_video {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  width: 160px;
+  height: 120px;
+  background: #333333;
+}
+#remote_video {
+  position: absolute;
+  top: 0px;
+  left: 0px;
+  width: 1024px;
+  height: 768px;
+  background: #999999;
+}
+</style>
+
+</head>
+<body onload="start()">
+  <div id="loading_state">
+    loading...
+  </div>
+  <div id="open_call_state">
+    <video id="remote_video"></video>
+    <video id="local_video"></video>
+  </div>
+</body>
+</html>
